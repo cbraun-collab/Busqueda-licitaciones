@@ -119,21 +119,27 @@ function procesarSolicitud(params) {
 
 // Motor de búsqueda compartido: lo usan tanto el dashboard (doGet) como el
 // resumen diario por correo. fechaDesde/fechaHasta son objetos Date.
+//
+// Hace las llamadas a la API EN PARALELO (por tandas, con fetchAll) en vez
+// de una por una — con rangos largos, uno por uno podía demorar minutos.
+const MAX_DETALLES_POR_BUSQUEDA = 300; // tope de seguridad para no colgar la búsqueda
+const TAMANO_TANDA = 40; // cuántas peticiones en paralelo por tanda
+
 function buscarLicitaciones(fechaDesde, fechaHasta, estados, keywords, MP_TICKET) {
-  const erroresDias = [];
-  const candidatos = []; // matches básicos, antes de pedir la ficha detallada
-
+  const fechas = [];
   for (let d = new Date(fechaDesde); d <= fechaHasta; d.setDate(d.getDate() + 1)) {
-    const fechaStr = formatearFechaAPI(d);
-    let listado;
-    try {
-      listado = obtenerListadoDia(fechaStr, MP_TICKET);
-    } catch (err) {
-      erroresDias.push(fechaStr);
-      continue;
-    }
+    fechas.push(formatearFechaAPI(d));
+  }
 
-    listado.forEach(function (lic) {
+  const listadosPorDia = obtenerListadosDias(fechas, MP_TICKET);
+  const erroresDias = fechas.filter(function (f) { return !listadosPorDia[f] || !listadosPorDia[f].ok; });
+
+  const candidatos = [];
+  fechas.forEach(function (fechaStr) {
+    const entrada = listadosPorDia[fechaStr];
+    if (!entrada || !entrada.ok) return;
+
+    entrada.listado.forEach(function (lic) {
       const estadoTexto = textoEstado(lic);
       const estadoLic = estadoTexto.toLowerCase();
       if (estados.length && estados.indexOf(estadoLic) === -1) return;
@@ -154,64 +160,126 @@ function buscarLicitaciones(fechaDesde, fechaHasta, estados, keywords, MP_TICKET
         matchCount: matches.length
       });
     });
-  }
+  });
 
   // Deduplicar por código (una licitación puede aparecer más de un día si se
-  // vuelve a consultar el mismo rango) y limitar el volumen de fichas detalladas
+  // vuelve a consultar el mismo rango)
   const vistos = {};
-  const unicos = candidatos.filter(function (c) {
+  let unicos = candidatos.filter(function (c) {
     if (vistos[c.codigo]) return false;
     vistos[c.codigo] = true;
     return true;
   });
 
+  // Tope de seguridad: si hay demasiados matches (rango muy amplio + filtro
+  // muy abierto), no intentamos pedir la ficha detallada de todos — eso es
+  // lo que colgaba la búsqueda. Se avisa en la respuesta si se truncó.
+  const truncado = unicos.length > MAX_DETALLES_POR_BUSQUEDA;
+  if (truncado) {
+    unicos.sort(function (a, b) { return (b.fechaCierre || '').localeCompare(a.fechaCierre || ''); });
+    unicos = unicos.slice(0, MAX_DETALLES_POR_BUSQUEDA);
+  }
+
+  const detallesPorCodigo = obtenerDetalles(unicos.map(function (c) { return c.codigo; }), MP_TICKET);
   const resultados = unicos.map(function (c) {
-    const detalle = obtenerDetalle(c.codigo, MP_TICKET);
-    return enriquecerConDetalle(c, detalle);
+    return enriquecerConDetalle(c, detallesPorCodigo[c.codigo]);
   });
 
   resultados.sort(function (a, b) {
     return (b.fechaCierre || '').localeCompare(a.fechaCierre || '');
   });
 
-  return { total: resultados.length, erroresDias: erroresDias, resultados: resultados };
+  return {
+    total: resultados.length,
+    erroresDias: erroresDias,
+    truncado: truncado,
+    resultados: resultados
+  };
 }
 
-function obtenerListadoDia(fechaStr, ticket) {
-  const cache = CacheService.getScriptCache();
-  const cacheKey = 'dia_' + fechaStr;
-  const cacheado = cache.get(cacheKey);
-  if (cacheado) return JSON.parse(cacheado);
-
-  const url = MP_BASE + '?fecha=' + fechaStr + '&estado=todos&ticket=' + encodeURIComponent(ticket);
-  const listado = fetchConReintento(url).Listado || [];
-
-  // Cache de 6 horas: los datos del día no cambian tan rápido y así varios
-  // usuarios / búsquedas repetidas no vuelven a golpear la cuota diaria.
-  try { cache.put(cacheKey, JSON.stringify(listado), 21600); } catch (e) { /* payload muy grande, se ignora el cache */ }
-
-  return listado;
+function partirEnTandas(arr, tamano) {
+  const tandas = [];
+  for (let i = 0; i < arr.length; i += tamano) tandas.push(arr.slice(i, i + tamano));
+  return tandas;
 }
 
-function obtenerDetalle(codigo, ticket) {
+// Trae el listado de varios días de una vez, en paralelo por tandas.
+// Devuelve un mapa { fechaStr: { ok, listado } }.
+function obtenerListadosDias(fechas, ticket) {
   const cache = CacheService.getScriptCache();
-  const cacheKey = 'lic_' + codigo;
-  const cacheado = cache.get(cacheKey);
-  if (cacheado) return JSON.parse(cacheado);
+  const resultado = {};
+  const pendientes = [];
 
-  const url = MP_BASE + '?codigo=' + encodeURIComponent(codigo) + '&ticket=' + encodeURIComponent(ticket);
-  let detalle = null;
-  try {
-    const data = fetchConReintento(url);
-    detalle = (data.Listado && data.Listado[0]) || null;
-  } catch (e) {
-    detalle = null;
-  }
+  fechas.forEach(function (fechaStr) {
+    const cacheado = cache.get('dia_' + fechaStr);
+    if (cacheado) {
+      resultado[fechaStr] = { ok: true, listado: JSON.parse(cacheado) };
+    } else {
+      pendientes.push({
+        fechaStr: fechaStr,
+        url: MP_BASE + '?fecha=' + fechaStr + '&estado=todos&ticket=' + encodeURIComponent(ticket)
+      });
+    }
+  });
 
-  if (detalle) {
-    try { cache.put(cacheKey, JSON.stringify(detalle), 21600); } catch (e) { /* ignorar */ }
-  }
-  return detalle;
+  partirEnTandas(pendientes, TAMANO_TANDA).forEach(function (tanda) {
+    const respuestas = UrlFetchApp.fetchAll(tanda.map(function (p) { return { url: p.url, muteHttpExceptions: true }; }));
+    respuestas.forEach(function (resp, i) {
+      const p = tanda[i];
+      try {
+        if (resp.getResponseCode() !== 200) throw new Error('HTTP ' + resp.getResponseCode());
+        const listado = JSON.parse(resp.getContentText()).Listado || [];
+        resultado[p.fechaStr] = { ok: true, listado: listado };
+        try { cache.put('dia_' + p.fechaStr, JSON.stringify(listado), 21600); } catch (e) { /* payload muy grande */ }
+      } catch (err) {
+        resultado[p.fechaStr] = { ok: false, listado: [] };
+      }
+    });
+  });
+
+  return resultado;
+}
+
+// Trae la ficha detallada de varios códigos de una vez, en paralelo por
+// tandas. Devuelve un mapa { codigo: detalle | null }.
+function obtenerDetalles(codigos, ticket) {
+  const cache = CacheService.getScriptCache();
+  const resultado = {};
+  const pendientes = [];
+
+  codigos.forEach(function (codigo) {
+    const cacheado = cache.get('lic_' + codigo);
+    if (cacheado) {
+      resultado[codigo] = JSON.parse(cacheado);
+    } else {
+      pendientes.push({
+        codigo: codigo,
+        url: MP_BASE + '?codigo=' + encodeURIComponent(codigo) + '&ticket=' + encodeURIComponent(ticket)
+      });
+    }
+  });
+
+  partirEnTandas(pendientes, TAMANO_TANDA).forEach(function (tanda) {
+    const respuestas = UrlFetchApp.fetchAll(tanda.map(function (p) { return { url: p.url, muteHttpExceptions: true }; }));
+    respuestas.forEach(function (resp, i) {
+      const p = tanda[i];
+      let detalle = null;
+      try {
+        if (resp.getResponseCode() === 200) {
+          const data = JSON.parse(resp.getContentText());
+          detalle = (data.Listado && data.Listado[0]) || null;
+        }
+      } catch (err) {
+        detalle = null;
+      }
+      resultado[p.codigo] = detalle;
+      if (detalle) {
+        try { cache.put('lic_' + p.codigo, JSON.stringify(detalle), 21600); } catch (e) { /* ignorar */ }
+      }
+    });
+  });
+
+  return resultado;
 }
 
 function enriquecerConDetalle(candidato, detalle) {
@@ -269,23 +337,6 @@ function extraerMontoDeTexto(texto) {
     }
   }
   return null;
-}
-
-function fetchConReintento(url) {
-  let ultimoError;
-  for (let intento = 0; intento < 3; intento++) {
-    try {
-      const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-      if (resp.getResponseCode() === 200) {
-        return JSON.parse(resp.getContentText());
-      }
-      ultimoError = new Error('HTTP ' + resp.getResponseCode());
-    } catch (err) {
-      ultimoError = err;
-    }
-    Utilities.sleep(400 * (intento + 1));
-  }
-  throw ultimoError;
 }
 
 function parseFechaDDMMAAAA(str) {

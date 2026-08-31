@@ -413,6 +413,11 @@ function mostrarResultados(data){
       '<div class="aviso">⚠️ <span><b>Advertencia:</b> algunos días no pudieron consultarse (' +
       data.erroresDias.length + ' error(es)). Los resultados pueden ser parciales.</span></div>';
   }
+  if (data.truncado){
+    document.getElementById('avisoErrores').innerHTML +=
+      '<div class="aviso">⚠️ <span><b>Búsqueda muy amplia:</b> se encontraron más de 300 licitaciones que calzan con tus filtros ' +
+      'y se muestran solo las 300 con cierre más próximo. Reduce el rango de fechas o selecciona menos palabras clave / estados para ver el resto.</span></div>';
+  }
 
   poblarFiltroRegion(data.resultados);
   renderizarCards(data.resultados);
